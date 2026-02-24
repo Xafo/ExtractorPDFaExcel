@@ -1,274 +1,370 @@
-import os
+# -*- coding: utf-8 -*-
 import re
-import glob
 import fitz  # PyMuPDF
 import pandas as pd
-from PIL import Image, ImageOps
+import numpy as np
+import cv2
+from PIL import Image, ImageOps, ImageFilter
 import pytesseract
-from pytesseract import Output
+
+# =========================
+# CONFIG
+# =========================
+PDF_PATH = r"./pdfs/1943853451940.pdf"
+OUT_CSV  = r"./certificados.csv"
+
+# En Windows (descomenta y ajusta):
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
+PAGE_ZOOM = 6.0
+LANG = "spa+eng"
+OCR_CFG = "--oem 1 --psm 6"
 
-# ========= CONFIG =========
-INPUT_DIR = r"./pdfs"
-OUTPUT_CSV = r"./certificados.csv"
-LANG = "spa"
+# Recorte relativo del bloque donde están los campos del vehículo (tu cuadro)
+# Si tu PDF tiene pequeñas variaciones, este box suele ser estable.
+BOX_MAIN = (0.37, 0.28, 0.95, 0.52)
 
-# Si tesseract no está en PATH, descomentá y ajustá:
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+ALL_FIELDS = ["certificado_no","marca","chasis","linea","pasajeros","modelo","clase","placa","motor","color"]
 
-# Reintentos: si no encuentra ancla o faltan campos clave, sube zoom
-ZOOMS = [2.6, 3.0, 3.4]
+VIN_ALLOWED = set("0123456789ABCDEFGHJKLMNPRSTUVWXYZ")  # sin I,O,Q
 
-# OCR
-CFG_DATA = "--oem 1 --psm 11"  # para localizar palabras (sparse)
-CFG_TEXT = "--oem 1 --psm 6 -c preserve_interword_spaces=1"  # para extraer texto del cuadro
-TARGET_W = 2400
 # =========================
-
-
-def preprocess(img: Image.Image, target_w=TARGET_W) -> Image.Image:
-    img = img.convert("L")
-    w, h = img.size
-    if w > target_w:
-        s = target_w / w
-        img = img.resize((int(w * s), int(h * s)))
-    img = ImageOps.autocontrast(img)
-    return img
-
-
-def render_page(pdf_path: str, page_index: int, zoom: float) -> Image.Image:
-    doc = fitz.open(pdf_path)
+# OCR PIPELINE
+# =========================
+def render_page(doc, page_index: int) -> Image.Image:
     page = doc.load_page(page_index)
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    doc.close()
+    pix = page.get_pixmap(matrix=fitz.Matrix(PAGE_ZOOM, PAGE_ZOOM), alpha=False)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
+def crop_rel(img: Image.Image, box):
+    w, h = img.size
+    x1, y1, x2, y2 = box
+    return img.crop((int(x1*w), int(y1*h), int(x2*w), int(y2*h)))
 
-def norm(s: str) -> str:
-    s = (s or "").upper()
-    s = s.replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def preprocess_remove_lines(pil_img: Image.Image) -> Image.Image:
+    """Quita líneas de tabla (verticales/horizontales) para que Tesseract no se confunda."""
+    gray = np.array(pil_img.convert("L"))
 
-
-def normalize_code(s: str) -> str:
-    s = norm(s).replace(" ", "")
-    # correcciones típicas OCR (ojo: no siempre aplica, pero ayuda)
-    trans = str.maketrans({"O": "0", "I": "1", "L": "1"})
-    return s.translate(trans)
-
-
-def find_anchor_box(page_img: Image.Image):
-    """
-    Busca el título del cuadro: 'DATOS GENERALES DE LA POLIZA'
-    Devuelve un rect (x1,y1,x2,y2) en pixeles alrededor del cuadro completo.
-    """
-    img = preprocess(page_img, target_w=1800)  # rápido para localizar
-    df = pytesseract.image_to_data(img, lang=LANG, config=CFG_DATA, output_type=Output.DATAFRAME)
-    df = df.dropna(subset=["text"])
-    df["t"] = df["text"].astype(str).map(norm)
-
-    # Palabras ancla (tolerante a OCR)
-    key1 = df[df["t"].str.contains(r"\bDATOS\b", regex=True, na=False)]
-    key2 = df[df["t"].str.contains(r"\bGENERA", regex=True, na=False)]  # GENERALES (trunc)
-    key3 = df[df["t"].str.contains(r"\bPOLI", regex=True, na=False)]    # POLIZA (trunc)
-
-    if key1.empty or key2.empty or key3.empty:
-        return None, img.size, page_img.size  # no encontró ancla
-
-    # Tomamos la línea/bloque superior más probable: el "DATOS GENERALES..."
-    # Estrategia: usar el candidato de "DATOS" más alto (menor top)
-    top_row = key1.sort_values("top").iloc[0]
-    top_y = int(top_row["top"])
-
-    # Como la imagen fue escalada, necesitamos factor para volver al tamaño original del page_img
-    w_scaled, h_scaled = img.size
-    w_orig, h_orig = page_img.size
-    sx = w_orig / w_scaled
-    sy = h_orig / h_scaled
-
-    # Definimos un recorte "grande" alrededor del cuadro tomando como referencia top_y del título.
-    # En tu layout, el cuadro amarillo empieza un poco arriba del título y termina bastante abajo.
-    y1 = max(0, int((top_y - 30) * sy))
-    y2 = min(h_orig, int((top_y + 360) * sy))  # ajusta si el cuadro es más alto
-    x1 = int(0.06 * w_orig)
-    x2 = int(0.94 * w_orig)
-
-    return (x1, y1, x2, y2), (w_scaled, h_scaled), (w_orig, h_orig)
-
-
-def ocr_text(img: Image.Image) -> str:
-    img = preprocess(img, target_w=TARGET_W)
-    return pytesseract.image_to_string(img, lang=LANG, config=CFG_TEXT)
-
-
-def get_field(text: str, labels, value_pat):
-    t = norm(text)
-    for lab in labels:
-        m = re.search(rf"{lab}\s*[:\-]?\s*{value_pat}", t)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-
-def best_vin(text: str) -> str:
-    t = norm(text)
-    cands = re.findall(r"\b[A-Z0-9]{11,20}\b", t)
-    if not cands:
-        return ""
-    cands = sorted(cands, key=lambda x: (abs(len(x) - 17), -len(x)))
-    return normalize_code(cands[0])
-
-
-def extract_fields_from_crop(crop_img: Image.Image) -> dict:
-    t = ocr_text(crop_img)
-
-    # Certificado (del header)
-    certificado = get_field(
-        t,
-        labels=[r"CERTI\w* NO\.?", r"CERTIFICADO NO\.?"],
-        value_pat=r"([0-9A-Z]{2,10})"
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 11
     )
+    inv = 255 - th
 
-    # Vehículo (bloque derecho); labels tolerantes
-    marca = get_field(t, [r"MARCA", r"M4RCA", r"MRCA"], r"([A-Z0-9]{2,25})")
-    chasis = get_field(t, [r"CHASIS", r"CH4SIS", r"CHAS1S"], r"([A-Z0-9]{11,20})")
-    if not chasis:
-        chasis = best_vin(t)
-    else:
-        chasis = normalize_code(chasis)
+    horiz = cv2.erode(inv, cv2.getStructuringElement(cv2.MORPH_RECT, (120, 1)), 1)
+    horiz = cv2.dilate(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (120, 1)), 1)
 
-    linea = get_field(t, [r"LINEA", r"L1NEA", r"LINFA"], r"([A-Z0-9]{1,12})")
+    vert = cv2.erode(inv, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 120)), 1)
+    vert = cv2.dilate(vert, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 120)), 1)
 
-    pasajeros = get_field(t, [r"PASAJER\w*"], r"(\d{1,2})")
+    lines = cv2.bitwise_or(horiz, vert)
+    cleaned = cv2.subtract(inv, lines)
+    out = 255 - cleaned
+    return Image.fromarray(out)
 
-    modelo = get_field(t, [r"MODELO", r"M0DELO", r"MODFLO"], r"((?:19|20)\d{2})")
-    if not modelo:
-        m = re.search(r"\b(19\d{2}|20\d{2})\b", norm(t))
-        modelo = m.group(1) if m else ""
+def preprocess_for_ocr(pil_img: Image.Image) -> Image.Image:
+    g = pil_img.convert("L")
+    g = ImageOps.autocontrast(g, cutoff=2)
+    g = g.filter(ImageFilter.SHARPEN)
+    return g
 
-    clase = get_field(t, [r"CLASE", r"CL4SE", r"CLASS"], r"([A-Z0-9]{2,20})")
-    clase = norm(clase).replace("CANON", "CAMION").replace("CAMOW", "CAMION").replace("CARON", "CAMION")
+def ocr(img: Image.Image) -> str:
+    return pytesseract.image_to_string(img, lang=LANG, config=OCR_CFG).replace("\x0c", "")
 
-    placa = get_field(t, [r"PLACA", r"PL4CA", r"PLAC4"], r"([A-Z0-9\-]{2,20})")
-    placa = normalize_code(placa)
+def norm_spaces(s: str) -> str:
+    return " ".join((s or "").split())
 
-    motor = get_field(t, [r"MOTOR", r"M0TOR"], r"([A-Z0-9]{2,25})")
-    motor = normalize_code(motor)
+# =========================
+# NORMALIZACIÓN / VALIDACIÓN
+# =========================
+def _filled(v):
+    if v is None: return False
+    if isinstance(v, float) and pd.isna(v): return False
+    s = str(v).strip()
+    return s != "" and s.lower() != "nan"
 
-    color = get_field(t, [r"COLOR", r"C0LOR"], r"([A-Z ]{3,50})")
+def normalize_cert(text: str) -> str:
+    m = re.search(r"(\d{3,4})", text or "")
+    return m.group(1) if m else ""
 
-    # Normalización marca (errores comunes)
-    marca = norm(marca).replace("TSUZU", "ISUZU").replace("SUZU", "ISUZU")
+def normalize_marca(text: str) -> str:
+    t = (text or "").upper()
+    if "ISUZU" in t: return "ISUZU"
+    t = re.sub(r"[^A-Z]", "", t)
+    return t[:15]
 
-    return {
-        "certificado_no": norm(certificado),
-        "marca": marca,
-        "chasis": chasis,
-        "linea": norm(linea),
-        "pasajeros": norm(pasajeros),
-        "modelo": norm(modelo),
-        "clase": norm(clase),
-        "placa": placa,
-        "motor": motor,
-        "color": norm(color),
+def normalize_linea(text: str) -> str:
+    t = (text or "").upper()
+    t = re.sub(r"[^A-Z0-9]", "", t)
+    if t in ("KP", "PP"):  # OCR común
+        return "NP"
+    return t[:4]
+
+def normalize_pasajeros(text: str) -> str:
+    m = re.search(r"(\d{1,2})", text or "")
+    if not m: return ""
+    v = int(m.group(1))
+    return m.group(1) if 1 <= v <= 60 else ""
+
+def normalize_modelo(text: str) -> str:
+    m = re.search(r"((?:19|20)\d{2})", text or "")
+    if not m: return ""
+    v = int(m.group(1))
+    return m.group(1) if 1990 <= v <= 2035 else ""
+
+def normalize_clase(text: str) -> str:
+    t = (text or "").upper()
+    # Mapeos típicos por OCR (CANON/CAMON/etc.) => CAMION
+    if "CAMION" in t:
+        return "CAMION"
+    if re.search(r"\bCANON\b|\bCAMON\b|\bCAMWON\b|\bAMMON\b|\bMAMON\b|\bSAMON\b|\bSON\b", t):
+        return "CAMION"
+    t = re.sub(r"[^A-Z]", "", t)
+    return t[:15]
+
+def normalize_placa(text: str) -> str:
+    t = (text or "").upper().replace(" ", "")
+    # patrones tipo C-6078YF, C.6078YF, C6078YF
+    m = re.search(r"([A-Z])[\.-]?(\d{3,4}[A-Z]{2,3})", t)
+    return f"{m.group(1)}-{m.group(2)}" if m else ""
+
+def normalize_motor(text: str) -> str:
+    t = re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+    # correcciones comunes
+    t = t.translate(str.maketrans({
+        "O":"0","Q":"0",
+        "I":"1","L":"1",
+        "S":"5","Z":"2",
+        "B":"8",
+        "U":"N",  # N a veces se lee U
+        "G":"6",  # 6 a veces se lee G
+    }))
+    t = re.sub(r"^MOTOR", "", t)
+    return t if 3 <= len(t) <= 10 else ""
+
+def normalize_chasis(text: str) -> str:
+    s = re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+    s = s.translate(str.maketrans({
+        "T":"7","V":"7",
+        "I":"1","L":"1",
+        "O":"0","Q":"0",
+        "G":"3",  # 3 suele leerse como G
+    }))
+
+    # Si aparece el prefijo observado, recorta ventana VIN
+    if len(s) >= 17:
+        idx = s.find("JAANPR")
+        if idx != -1 and idx + 17 <= len(s):
+            s = s[idx:idx+17]
+        else:
+            s = s[:17]
+
+    # fuerza patrón JAANPR7...
+    if s.startswith("JAANPR") and len(s) >= 7:
+        s = "JAANPR7" + s[7:]
+
+    # valida alfabeto VIN
+    if len(s) == 17 and all(c in VIN_ALLOWED for c in s):
+        return s
+    return s[:17]
+
+def normalize_color(text: str) -> str:
+    t = (text or "").upper()
+    t = re.sub(r"[^A-ZÁÉÍÓÚÑ ]", "", t).strip()
+    # OCR típico
+    t = (t.replace("JLANCO","BLANCO")
+           .replace("8LANCO","BLANCO")
+           .replace("BIANCO","BLANCO")
+           .replace("MANCO","BLANCO"))
+    # solo primera palabra (BLANCO, ROJO, etc.)
+    return t.split()[0] if t else ""
+
+# VALIDADORES (para métrica de "validez")
+def v_cert(x):
+    if not _filled(x): return False
+    try:
+        v = int(str(x).split(".")[0])
+        return 1 <= v <= 9999
+    except:
+        return False
+
+def v_marca(x):
+    if not _filled(x): return False
+    return bool(re.fullmatch(r"[A-Z]{3,15}", str(x).strip().upper()))
+
+def v_chasis(x):
+    if not _filled(x): return False
+    s = re.sub(r"[^A-Z0-9]", "", str(x).upper())
+    return len(s) == 17 and all(c in VIN_ALLOWED for c in s)
+
+def v_linea(x):
+    if not _filled(x): return False
+    return bool(re.fullmatch(r"[A-Z0-9]{1,4}", str(x).strip().upper()))
+
+def v_pasajeros(x):
+    if not _filled(x): return False
+    try:
+        v = int(float(x))
+        return 1 <= v <= 60
+    except:
+        return False
+
+def v_modelo(x):
+    if not _filled(x): return False
+    try:
+        v = int(float(x))
+        return 1990 <= v <= 2035
+    except:
+        return False
+
+def v_clase(x):
+    if not _filled(x): return False
+    return bool(re.fullmatch(r"[A-Z]{3,15}", str(x).strip().upper()))
+
+def v_placa(x):
+    if not _filled(x): return False
+    return bool(re.fullmatch(r"[A-Z]-\d{3,4}[A-Z]{2,3}", str(x).strip().upper()))
+
+def v_motor(x):
+    if not _filled(x): return False
+    return bool(re.fullmatch(r"[A-Z0-9]{3,10}", str(x).strip().upper()))
+
+def v_color(x):
+    if not _filled(x): return False
+    return bool(re.fullmatch(r"[A-ZÁÉÍÓÚÑ]{3,15}", str(x).strip().upper()))
+
+VALIDATORS = {
+    "certificado_no": v_cert,
+    "marca": v_marca,
+    "chasis": v_chasis,
+    "linea": v_linea,
+    "pasajeros": v_pasajeros,
+    "modelo": v_modelo,
+    "clase": v_clase,
+    "placa": v_placa,
+    "motor": v_motor,
+    "color": v_color,
+}
+
+# =========================
+# EXTRACCIÓN POR PÁGINA
+# =========================
+def extract_page(doc, page_index: int) -> dict:
+    page_img = render_page(doc, page_index)
+    main = crop_rel(page_img, BOX_MAIN)
+
+    # quita líneas + mejora contraste
+    main = preprocess_for_ocr(preprocess_remove_lines(main))
+
+    full_text = norm_spaces(ocr(main)).upper()
+
+    def grab(pat: str) -> str:
+        m = re.search(pat, full_text)
+        return m.group(1).strip() if m else ""
+
+    # Regex tolerantes (si OCR lee CERTINCADO/M0DELO/etc., ajusta aquí)
+    raw_cert = grab(r"CERT\w*ADO\s*NO\.?\s*[:\.]?\s*(\d{3,4})")
+    raw_marca = grab(r"MARCA\s*:\s*([A-Z]{3,10})")
+    raw_chasis = grab(r"CHASIS\s*:\s*([A-Z0-9]{10,25})")
+    raw_linea = grab(r"LINEA\s*:\s*([A-Z0-9]{1,4})")
+    raw_pas = grab(r"PASAJEROS\s*:\s*(\d{1,2})")
+    raw_modelo = grab(r"MODELO\s*:\s*((?:19|20)\d{2})")
+    raw_clase = grab(r"CLASE\s*:\s*([A-Z]{3,10})")
+    raw_placa = grab(r"PLACA\s*:\s*([A-Z0-9\-\.\s]{4,15})")
+    raw_motor = grab(r"MOTOR\s*:\s*([A-Z0-9\s]{3,12})")
+    raw_color = grab(r"COLOR\s*:\s*([A-ZÁÉÍÓÚÑ]{3,15})")
+
+    row = {
+        "certificado_no": normalize_cert(raw_cert),
+        "marca": normalize_marca(raw_marca),
+        "chasis": normalize_chasis(raw_chasis),
+        "linea": normalize_linea(raw_linea),
+        "pasajeros": normalize_pasajeros(raw_pas),
+        "modelo": normalize_modelo(raw_modelo),
+        "clase": normalize_clase(raw_clase),
+        "placa": normalize_placa(raw_placa),
+        "motor": normalize_motor(raw_motor),
+        "color": normalize_color(raw_color),
     }
+    return row
 
+# =========================
+# MÉTRICAS (TODO LOS CAMPOS)
+# =========================
+def compute_metrics(df: pd.DataFrame):
+    df = df.copy()
+    for c in ALL_FIELDS:
+        if c not in df.columns:
+            df[c] = None
+    df = df[ALL_FIELDS]
 
-def score(row: dict) -> float:
-    # campos clave para tu KPI
-    keys = ["certificado_no", "marca", "chasis", "modelo", "clase", "color"]
-    got = sum(1 for k in keys if row.get(k))
-    return got / len(keys)
+    filled_matrix = df.apply(lambda col: col.map(_filled))
+    row_fill = filled_matrix.sum(axis=1) / len(ALL_FIELDS)
 
+    valid_matrix = pd.DataFrame({c: df[c].map(VALIDATORS[c]) for c in ALL_FIELDS})
+    row_valid = valid_matrix.sum(axis=1) / len(ALL_FIELDS)
 
-def extract_page(pdf_path: str, page_index: int) -> dict:
-    last = None
-    for zoom in ZOOMS:
-        page_img = render_page(pdf_path, page_index, zoom=zoom)
+    global_fill = row_fill.mean()
+    global_valid = row_valid.mean()
 
-        box, _, _ = find_anchor_box(page_img)
-        if box is None:
-            # fallback: recorte fijo aproximado del área donde suele estar el cuadro (por si falla ancla)
-            w, h = page_img.size
-            box = (int(0.06*w), int(0.38*h), int(0.94*w), int(0.74*h))
+    fill_by_field = filled_matrix.mean().sort_values(ascending=False)
+    valid_by_field = valid_matrix.mean().sort_values(ascending=False)
 
-        crop = page_img.crop(box)
-        row = extract_fields_from_crop(crop)
-        last = row
+    return row_fill, row_valid, global_fill, global_valid, fill_by_field, valid_by_field
 
-        if score(row) >= 0.95:
-            break
-
-    return last if last else {
-        "certificado_no": "",
-        "marca": "",
-        "chasis": "",
-        "linea": "",
-        "pasajeros": "",
-        "modelo": "",
-        "clase": "",
-        "placa": "",
-        "motor": "",
-        "color": "",
-    }
-
-
+# =========================
+# MAIN
+# =========================
 def main():
-    pdfs = sorted(glob.glob(os.path.join(INPUT_DIR, "*.pdf")))
-    if not pdfs:
-        print(f"No encontré PDFs en: {INPUT_DIR}")
-        return
+    print(f"Procesando {PDF_PATH}")
 
-    results = []
-    total_pages = 0
-    errors = 0
+    doc = fitz.open(PDF_PATH)
+    rows = []
 
-    for pdf_path in pdfs:
-        doc = fitz.open(pdf_path)
-        n = len(doc)
-        doc.close()
-        total_pages += n
-        print(f"Procesando {os.path.basename(pdf_path)} ({n} páginas)")
+    for i in range(len(doc)):
+        row = extract_page(doc, i)
+        rows.append(row)
 
-        for i in range(n):
-            try:
-                results.append(extract_page(pdf_path, i))
-            except Exception as e:
-                errors += 1
-                print(f"  !! ERROR en {os.path.basename(pdf_path)} pág {i+1}: {e}")
-                results.append({
-                    "certificado_no": "",
-                    "marca": "",
-                    "chasis": "",
-                    "linea": "",
-                    "pasajeros": "",
-                    "modelo": "",
-                    "clase": "",
-                    "placa": "",
-                    "motor": "",
-                    "color": "",
-                })
+        # reporte rápido por página (fill/valid sobre 10 campos)
+        tmp = pd.DataFrame([row])[ALL_FIELDS]
+        row_fill, row_valid, _, _, _, _ = compute_metrics(tmp)
+        fill_cnt = int(row_fill.iloc[0] * 10)
+        valid_cnt = int(row_valid.iloc[0] * 10)
 
-    df = pd.DataFrame(results)
-    cols = ["certificado_no","marca","chasis","linea","pasajeros","modelo","clase","placa","motor","color"]
-    df = df[cols]
+        print(
+            f"  Pag {i+1:2d}: "
+            f"cert={row['certificado_no']:<4} "
+            f"marca={row['marca']:<6} "
+            f"chasis={row['chasis']:<17} "
+            f"linea={row['linea']:<3} "
+            f"pas={row['pasajeros']:<2} "
+            f"modelo={row['modelo']:<4} "
+            f"clase={row['clase']:<6} "
+            f"placa={row['placa']:<10} "
+            f"motor={row['motor']:<6} "
+            f"color={row['color']:<10} "
+            f"(fill {fill_cnt}/10 | valid {valid_cnt}/10)"
+        )
 
-    key_fields = ["certificado_no","marca","chasis","modelo","clase","color"]
-    completeness = (
-        df[key_fields].astype(str).replace("", pd.NA).notna().sum(axis=1) / len(key_fields)
-    ).mean() * 100
+    df = pd.DataFrame(rows)[ALL_FIELDS]
+    df.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
 
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"\nOK -> {OUTPUT_CSV}")
-    print(f"Filas: {len(df)} | Páginas esperadas: {total_pages} | Errores: {errors}")
-    print(f"Completitud promedio (campos clave): {completeness:.2f}%")
+    # Métricas globales basadas en TODO
+    row_fill, row_valid, gfill, gvalid, fill_field, valid_field = compute_metrics(df)
 
-    # Si querés revisar solo las filas flojas:
-    # low = df[(df[key_fields].astype(str).replace('', pd.NA).notna().sum(axis=1) / len(key_fields)) < 0.95]
-    # low.to_csv("revisar_bajo_95.csv", index=False, encoding="utf-8-sig")
+    print("\nOK ->", OUT_CSV)
+    print("Filas:", len(df), "| Paginas esperadas:", len(doc))
+    print(f"\nCompletitud TOTAL (10 campos): {gfill*100:.2f}%")
+    print(f"Validez TOTAL (10 campos):     {gvalid*100:.2f}%")
 
+    print("\n-- Completitud por campo (no vacio) --")
+    for k, v in fill_field.items():
+        print(f"{k:15s}: {v*100:6.2f}%")
+
+    print("\n-- Validez por campo (pasa validacion) --")
+    for k, v in valid_field.items():
+        print(f"{k:15s}: {v*100:6.2f}%")
 
 if __name__ == "__main__":
     main()
