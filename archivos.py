@@ -13,7 +13,7 @@ import cv2
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 
-PDF_PATH = r"./pdfs/1943853451940.pdf"
+PDF_PATH = r"./pdfs/"
 OUT_CSV  = r"./certificados.csv"
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -610,40 +610,72 @@ def compute_metrics(df: pd.DataFrame):
     return completeness, by_field
 
 def main():
-    print(f"Procesando {PDF_PATH}")
-    doc = fitz.open(PDF_PATH)
+    import os
+    import glob
 
-    rows = []
-    for i in range(len(doc)):
-        row = extract_page(doc, i)
-        rows.append(row)
+    # Carpeta donde están los PDFs (ajustá si tu ruta es distinta)
+    pdf_dir = "./pdfs"
+    out_csv = OUT_CSV  # usa tu constante existente, ej: "./certificados.csv"
 
-        valid_cnt = sum(1 for k in FIELDS if str(row[k]).strip() != "")
-        print(
-            f"  Pag {i+1:2d}: "
-            f"cert={row['certificado_no']:<4} "
-            f"marca={row['marca']:<6} "
-            f"chasis={row['chasis']:<17} "
-            f"linea={row['linea']:<12} "
-            f"pas={row['pasajeros']:<2} "
-            f"modelo={row['modelo']:<4} "
-            f"clase={row['clase']:<16} "
-            f"placa={row['placa']:<12} "
-            f"motor={row['motor']:<10} "
-            f"color={row['color']:<22} "
-            f"(valid {valid_cnt}/10)"
-        )
+    pdf_paths = sorted(glob.glob(os.path.join(pdf_dir, "*.pdf")))
+    if not pdf_paths:
+        print(f"No encontré PDFs en: {pdf_dir}")
+        return
 
-    df = pd.DataFrame(rows)[FIELDS]
-    df.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+    all_rows = []
+    total_pages_expected = 0
 
-    comp, by_field = compute_metrics(df)
-    print("\nOK ->", OUT_CSV)
-    print("Filas:", len(df), "| Paginas esperadas:", len(doc))
+    for pdf_path in pdf_paths:
+        print(f"\nProcesando {pdf_path}")
+        doc = fitz.open(pdf_path)
+        total_pages_expected += len(doc)
+
+        for i in range(len(doc)):
+            row = extract_page(doc, i)
+
+            # (Opcional) agrega el nombre del archivo para rastrear de dónde salió cada fila
+            row["archivo_pdf"] = os.path.basename(pdf_path)
+
+            all_rows.append(row)
+
+            valid_cnt = sum(1 for k in FIELDS if str(row.get(k, "")).strip() != "")
+            print(
+                f"  Pag {i+1:2d}: "
+                f"cert={row.get('certificado_no',''):<4} "
+                f"marca={row.get('marca',''):<10} "
+                f"chasis={row.get('chasis',''):<17} "
+                f"linea={row.get('linea',''):<12} "
+                f"pas={row.get('pasajeros',''):<2} "
+                f"modelo={row.get('modelo',''):<4} "
+                f"clase={row.get('clase',''):<16} "
+                f"placa={row.get('placa',''):<12} "
+                f"motor={row.get('motor',''):<10} "
+                f"color={row.get('color',''):<22} "
+                f"(valid {valid_cnt}/10)"
+            )
+
+    # Si agregaste archivo_pdf, lo incluimos en el CSV al inicio
+    final_fields = (["archivo_pdf"] + FIELDS) if all_rows and "archivo_pdf" in all_rows[0] else FIELDS
+
+    df = pd.DataFrame(all_rows)
+    # asegurar columnas y orden
+    for col in final_fields:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[final_fields]
+
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    # Métricas solo sobre los 10 campos originales (no cuenta archivo_pdf)
+    df_metrics = df[FIELDS].copy()
+    comp, by_field = compute_metrics(df_metrics)
+
+    print("\nOK ->", out_csv)
+    print("Filas:", len(df), "| Paginas esperadas:", total_pages_expected)
     print(f"\nCompletitud TOTAL (10 campos): {comp*100:.2f}%")
     print("\n-- Llenado por campo (post-validación) --")
     for k, v in by_field.items():
         print(f"{k:15s}: {v*100:6.2f}%")
-
+        
 if __name__ == "__main__":
     main()
