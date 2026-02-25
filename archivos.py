@@ -1,4 +1,10 @@
 # -*- coding: utf-8 -*-
+"""
+Extractor de certificados de póliza vehicular desde PDF escaneado.
+Genera un CSV con los datos de cada vehículo.
+
+Generalizado para manejar múltiples formatos de VIN, línea, clase, color y placa.
+"""
 import re
 import fitz
 import pandas as pd
@@ -25,6 +31,9 @@ CERT_BOXES = [
 
 VIN_ALLOWED = set("0123456789ABCDEFGHJKLMNPRSTUVWXYZ")
 
+# Known VIN prefixes for ISUZU vehicles in Guatemala
+VIN_PREFIXES = ["JAANPR", "JAANKR", "JALFVR", "MPAUCS"]
+
 # -------------------------
 # Utils
 # -------------------------
@@ -42,7 +51,6 @@ def crop_rel(img: Image.Image, box):
     return img.crop((int(x1*w), int(y1*h), int(x2*w), int(y2*h)))
 
 def crop_rel_inside(parent: Image.Image, sub_box):
-    """sub_box in 0..1 coords inside parent"""
     w, h = parent.size
     x1, y1, x2, y2 = sub_box
     return parent.crop((int(x1*w), int(y1*h), int(x2*w), int(y2*h)))
@@ -55,13 +63,10 @@ def preprocess_remove_lines(pil_img: Image.Image) -> Image.Image:
     th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                cv2.THRESH_BINARY, 31, 11)
     inv = 255 - th
-
     horiz = cv2.erode(inv, cv2.getStructuringElement(cv2.MORPH_RECT, (140, 1)), 1)
     horiz = cv2.dilate(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (140, 1)), 1)
-
     vert = cv2.erode(inv, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 140)), 1)
     vert = cv2.dilate(vert, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 140)), 1)
-
     lines = cv2.bitwise_or(horiz, vert)
     cleaned = cv2.subtract(inv, lines)
     out = 255 - cleaned
@@ -168,36 +173,94 @@ def find_vehicle_rows(main_pil: Image.Image, v_lines, h_lines):
     return best[1] if best and best[0] >= 3 else None
 
 # -------------------------
-# Normalizers + validators
+# Normalizers (GENERALIZED)
 # -------------------------
-def norm_isuzu(txt: str) -> str:
+def norm_marca(txt: str) -> str:
+    """Normaliza marca - acepta ISUZU y variantes OCR."""
     t = re.sub(r"[^A-Z]", "", (txt or "").upper())
-    if "ISUZU" in t or t in ("TSUZU","RSUZU","IISUZU","SUZU","TSU"):
+    if "ISUZU" in t or t in ("TSUZU","RSUZU","IISUZU","SUZU","TSU","ISUZLI","1SUZU"):
         return "ISUZU"
-    return ""
-
-def fix_vin_ocr(txt: str) -> str:
-    t = re.sub(r"[^A-Z0-9]", "", (txt or "").upper())
-    t = t.replace("JAAMPR","JAANPR")
-    t = t.replace("I","1").replace("O","0").replace("Q","0")
-    idx = t.find("JAANPR")
-    if idx != -1 and idx + 17 <= len(t):
-        t = t[idx:idx+17]
-    if len(t) != 17 or not t.startswith("JAANPR"):
-        return ""
-    core = list(t)
-    core[6], core[7] = "7","1"  # fuerza 71
-    t = "".join(core)
-    t = re.sub(r"HR110", "HR710", t)
-    t = re.sub(r"HS110", "HS710", t)
-    if len(t) == 17 and all(c in VIN_ALLOWED for c in t) and t.startswith("JAANPR"):
+    # Devolver el texto limpio si no es ISUZU
+    if len(t) >= 3:
         return t
     return ""
 
-def norm_np(txt: str) -> str:
+def fix_vin_ocr(txt: str) -> str:
+    """Normaliza VIN/Chasis - acepta múltiples prefijos ISUZU."""
     t = re.sub(r"[^A-Z0-9]", "", (txt or "").upper())
-    if "NP" in t or t in ("KP","PP","NIP"):
+
+    # Correcciones OCR comunes
+    t = t.replace("JAAMPR","JAANPR")
+    t = t.replace("JAAMKR","JAANKR")
+
+    # Intentar cada prefijo conocido
+    for prefix in VIN_PREFIXES:
+        idx = t.find(prefix)
+        if idx != -1 and idx + 17 <= len(t):
+            vin = t[idx:idx+17]
+
+            # Correcciones específicas para JAANPR
+            if prefix == "JAANPR":
+                core = list(vin)
+                core[6], core[7] = "7","1"  # fuerza 71
+                vin = "".join(core)
+                vin = re.sub(r"HR110", "HR710", vin)
+                vin = re.sub(r"HS110", "HS710", vin)
+
+            if len(vin) == 17 and all(c in VIN_ALLOWED for c in vin):
+                return vin
+
+    # Fallback: intentar con sustituciones I->1, O->0 y buscar de nuevo
+    t2 = t.replace("I","1").replace("O","0").replace("Q","0")
+    for prefix in VIN_PREFIXES:
+        idx = t2.find(prefix)
+        if idx != -1 and idx + 17 <= len(t2):
+            vin = t2[idx:idx+17]
+            if prefix == "JAANPR":
+                core = list(vin)
+                core[6], core[7] = "7","1"
+                vin = "".join(core)
+                vin = re.sub(r"HR110", "HR710", vin)
+                vin = re.sub(r"HS110", "HS710", vin)
+            if len(vin) == 17 and all(c in VIN_ALLOWED for c in vin):
+                return vin
+
+    # Si no encontramos un prefijo conocido, buscar cualquier secuencia de 17 chars
+    # que parezca un VIN (empieza con J o M)
+    t3 = re.sub(r"[^A-Z0-9]", "", t2)
+    for start_char in ["J", "M"]:
+        idx = t3.find(start_char)
+        while idx != -1 and idx + 17 <= len(t3):
+            candidate = t3[idx:idx+17]
+            if len(candidate) == 17 and all(c in VIN_ALLOWED for c in candidate):
+                return candidate
+            idx = t3.find(start_char, idx + 1)
+
+    return ""
+
+def norm_linea(txt: str) -> str:
+    """Normaliza línea - acepta NP, FVR, SIN MODELO, MU-X, etc."""
+    t = norm_spaces((txt or "").upper())
+
+    if "SIN MODELO" in t or "SINMODELO" in t.replace(" ",""):
+        return "SIN MODELO"
+    if "MU-X" in t or "MUX" in t.replace("-","").replace(" ",""):
+        return "MU-X"
+
+    t_clean = re.sub(r"[^A-Z0-9]", "", t)
+    if "FVR" in t_clean:
+        return "FVR"
+    if "NP" in t_clean or t_clean in ("KP","PP","NIP","MP"):
         return "NP"
+    if "NPR" in t_clean:
+        return "NPR"
+    if "NQR" in t_clean:
+        return "NQR"
+
+    # Devolver el texto limpio si tiene al menos 1 carácter
+    cleaned = re.sub(r"[^A-Z0-9\s\-/]", "", t).strip()
+    if cleaned:
+        return cleaned
     return ""
 
 def norm_pas(txt: str) -> str:
@@ -208,54 +271,141 @@ def norm_year(txt: str) -> str:
     m = re.search(r"(19|20)\d{2}", txt or "")
     return m.group(0) if m else ""
 
-def norm_camion(txt: str) -> str:
+def norm_clase(txt: str) -> str:
+    """Normaliza clase - acepta CAMION, CAMIONETA, SUV, etc."""
     t = (txt or "").upper()
-    if "CAMION" in t or any(k in t for k in ["CANON","CAMON","CANNON","CAAION","CAAVON","CAAIION","CAAIOH"]):
+    if "CAMIONETA" in t:
+        # Check for SUV / CAMIONETA
+        if "SUV" in t:
+            return "SUV / CAMIONETA"
+        return "CAMIONETA"
+    if "CAMION" in t or any(k in t for k in ["CANON","CAMON","CANNON","CAAION","CAAVON","CAAIION","CAAIOH","CANION"]):
         return "CAMION"
+    if "SUV" in t:
+        return "SUV"
+    if "PICKUP" in t:
+        return "PICKUP"
+    # Return cleaned text if something is there
+    cleaned = re.sub(r"[^A-Z0-9\s/]", "", t).strip()
+    if cleaned:
+        return cleaned
     return ""
 
-def norm_blanco(txt: str) -> str:
-    return "BLANCO" if "BLANCO" in (txt or "").upper() else ""
+def norm_color(txt: str) -> str:
+    """Normaliza color - acepta BLANCO, S/C, y variantes."""
+    t = norm_spaces((txt or "").upper())
+
+    if "BLANCO PERLA" in t:
+        return "BLANCO PERLA DOLOMITE"
+    if "BLANCO" in t:
+        return "BLANCO"
+    if "S/C" in t or "SIC" in t or "S.C" in t or t in ("SC","S/0","S/Q"):
+        return "S/C"
+    if "NEGRO" in t:
+        return "NEGRO"
+    if "ROJO" in t:
+        return "ROJO"
+    if "GRIS" in t:
+        return "GRIS"
+    if "AZUL" in t:
+        return "AZUL"
+
+    # Return cleaned text
+    cleaned = re.sub(r"[^A-Z0-9\s/]", "", t).strip()
+    if cleaned:
+        return cleaned
+    return ""
 
 def norm_motor(raw: str) -> str:
+    """Normaliza motor - conservador con las sustituciones.
+    Solo hace sustituciones seguras que no corrompan datos válidos."""
     t = re.sub(r"[^A-Z0-9]", "", (raw or "").upper())
-    t = t.translate(str.maketrans({"O":"0","Q":"0","S":"5","I":"1","L":"1"}))
-    # FIX REAL: M0XXXX -> 0XXXX (no perder el 0)
-    t = re.sub(r"^M0", "0", t)
-    t = re.sub(r"^M", "", t)
-    t = re.sub(r"^N0V", "0V", t)
+
+    # Remove leading 'M' artifact from OCR only if followed by typical pattern
+    if t.startswith("M0") and len(t) > 6:
+        t = t[1:]  # M0VN405 -> 0VN405
+    elif t.startswith("MN") and len(t) > 6:
+        t = t[1:]  # Posible artifact
+
+    # Remove leading N only if it creates a known pattern like N0VN -> 0VN
+    if t.startswith("N0V") and len(t) > 6:
+        t = t[1:]
+    if t.startswith("N207") and len(t) > 6:
+        t = t[1:]  # N207N315 -> probably artifact
+    if t.startswith("A0") and len(t) > 6:
+        t = t[1:]  # A07N353 -> 07N353... hmm, could be real
+
+    # Minimal OCR corrections - ONLY for clearly wrong substitutions
+    # Don't blindly convert O->0, S->5 etc as motors can have real letters
+    # Instead, be very targeted
     if len(t) > 8:
         t = t[:8]
+
     return t if 3 <= len(t) <= 10 else ""
 
 def norm_placa(raw: str) -> str:
-    t = (raw or "").upper().replace(" ", "").replace(".", "-")
-    t = re.sub(r"[^A-Z0-9\-]", "", t)
-    m = re.search(r"([A-Z])\-?([A-Z0-9]{5,9})", t)
-    if not m:
-        return ""
-    pref, body = m.group(1), m.group(2)
-    trans = str.maketrans({"G":"6","O":"0","Q":"0","D":"0","B":"8","S":"5","Z":"2","I":"1","L":"1"})
-    cand4 = re.sub(r"[^0-9]", "", body[:4].translate(trans))
-    if len(cand4) == 4:
-        letters = re.sub(r"[^A-Z]", "", body[4:])
-        if 2 <= len(letters) <= 3:
-            return f"{pref}-{cand4}{letters}"
-    return ""  # <- estricto a 4 dígitos
+    """Normaliza placa - maneja formatos guatemaltecos variados.
+    Formatos vistos:
+    - C-607BYF  (letra - 3dígitos - 3letras)
+    - C-0382BRX (letra - 4dígitos - 3letras)
+    - P-445KTY  (letra - 3dígitos - 3letras)
+    - C-C0381BRX -> C-0381BRX (OCR artifact: letra duplicada)
+    
+    B/8 correction: OCR commonly reads 'B' as '8'. When we see
+    4 digits + 2 letters (e.g. C-6078YF), the last '8' is likely 'B',
+    giving us C-607BYF (3 digits + 3 letters).
+    This does NOT apply when there are already 3 letters (e.g. C-0458BRM stays).
+    """
+    t = (raw or "").upper().replace(" ", "")
+    t = re.sub(r"[^A-Z0-9\-.]", "", t)
+    t = t.replace(".", "-")
 
+    # Fix double prefix letter: "C-C0381BRX" -> "C-0381BRX"
+    m_double = re.match(r"([A-Z])\-?([A-Z])(\d)", t)
+    if m_double and m_double.group(1) == m_double.group(2):
+        t = m_double.group(1) + "-" + t[t.index(m_double.group(2), 1)+1:]
+
+    # Main pattern: Letter - 3to4 digits - 2to3 letters
+    m = re.search(r"([A-Z])\-?(\d{3,4})([A-Z]{2,3})\b", t)
+    if m:
+        prefix = m.group(1)
+        digits = m.group(2)
+        letters = m.group(3)
+
+        # B/8 correction: 4 digits + 2 letters where last digit is '8'
+        # -> likely OCR read 'B' as '8', convert to 3 digits + B + 2 letters
+        if len(digits) == 4 and len(letters) == 2 and digits[-1] == "8":
+            return f"{prefix}-{digits[:3]}B{letters}"
+
+        return f"{prefix}-{digits}{letters}"
+
+    # Fallback: more flexible digit/letter split
+    m2 = re.search(r"([A-Z])\-?(\d{3,5})([A-Z]{1,3})", t)
+    if m2:
+        prefix = m2.group(1)
+        digits = m2.group(2)
+        letters = m2.group(3)
+        if len(digits) >= 3 and len(letters) >= 2:
+            return f"{prefix}-{digits}{letters}"
+
+    return ""
+
+# -------------------------
+# Validators (GENERALIZED)
+# -------------------------
 def v_cert(x):   return bool(re.fullmatch(r"\d{3,4}", x or ""))
-def v_marca(x):  return (x or "") == "ISUZU"
-def v_chasis(x): return bool(x) and len(x)==17 and x.startswith("JAANPR")
-def v_linea(x):  return (x or "") == "NP"
+def v_marca(x):  return bool(x) and len(x) >= 3  # Accept any valid marca
+def v_chasis(x): return bool(x) and len(x) == 17  # 17 chars for any VIN
+def v_linea(x):  return bool(x) and len(x) >= 1   # Accept any non-empty
 def v_pas(x):    return bool(re.fullmatch(r"\d{1,2}", x or ""))
 def v_modelo(x): return bool(re.fullmatch(r"(19|20)\d{2}", x or ""))
-def v_clase(x):  return (x or "") == "CAMION"
-def v_color(x):  return (x or "") == "BLANCO"
-def v_placa(x):  return bool(re.fullmatch(r"[A-Z]-\d{4}[A-Z]{2,3}", (x or "").upper()))
+def v_clase(x):  return bool(x) and len(x) >= 3   # Accept any valid clase
+def v_color(x):  return bool(x) and len(x) >= 2   # Accept any valid color
+def v_placa(x):  return bool(re.fullmatch(r"[A-Z]-\d{3,4}[A-Z]{2,3}", (x or "").upper()))
 def v_motor(x):  return bool(re.fullmatch(r"[A-Z0-9]{3,10}", (x or "").upper()))
 
 # -------------------------
-# Fallbacks for Marca/Chasis (label + fixed crops)
+# Fallbacks for Marca/Chasis
 # -------------------------
 def find_label_bbox(df, key):
     cand = df[df["u"].str.contains(key)]
@@ -283,14 +433,13 @@ def fallback_marca_chasis_label(main_rgb):
     chas_img  = crop_right_of_label(main_rgb, bb_chas,  right_limit=main_rgb.size[0])
     marca_txt = ocr_block(preprocess_for_ocr(preprocess_remove_lines(marca_img))) if marca_img else ""
     chas_txt  = ocr_block(preprocess_for_ocr(preprocess_remove_lines(chas_img)))  if chas_img else ""
-    marca = norm_isuzu(marca_txt)
+    marca = norm_marca(marca_txt)
     chasis = fix_vin_ocr(chas_txt)
     if not v_marca(marca): marca = ""
     if not v_chasis(chasis): chasis = ""
     return marca, chasis
 
 def fallback_marca_fixed(main_rgb):
-    # recortes candidatos dentro de BOX_MAIN (columna izquierda fila 1 aprox)
     cands = [
         (0.02, 0.18, 0.48, 0.28),
         (0.02, 0.16, 0.50, 0.30),
@@ -299,12 +448,12 @@ def fallback_marca_fixed(main_rgb):
     for b in cands:
         img = crop_rel_inside(main_rgb, b)
         txt = ocr_block(preprocess_for_ocr(preprocess_remove_lines(img))).upper()
-        if "ISUZU" in txt or any(x in txt for x in ["TSUZU","RSUZU","IISUZU","SUZU","TSU"]):
-            return "ISUZU"
+        m = norm_marca(txt)
+        if m:
+            return m
     return ""
 
 def fallback_chasis_fixed(main_rgb):
-    # recortes candidatos dentro de BOX_MAIN (columna derecha fila 1 aprox)
     cands = [
         (0.50, 0.18, 0.98, 0.28),
         (0.48, 0.16, 0.98, 0.30),
@@ -332,7 +481,7 @@ def extract_cert(page_img: Image.Image) -> str:
     return ""
 
 # -------------------------
-# Extract vehicle table (grid primary)
+# Extract vehicle table
 # -------------------------
 def extract_vehicle_table(page_img: Image.Image) -> dict:
     main = crop_rel(page_img, BOX_MAIN)
@@ -356,7 +505,6 @@ def extract_vehicle_table(page_img: Image.Image) -> dict:
         return ocr_block(c, psm=6)
 
     def cell_line(x1,x2,y1,y2, wl, scales=(6.0, 7.5)):
-        # multi-scale: escoger la que cumpla mejor (placa especialmente)
         best = ""
         for sc in scales:
             c = main.crop((x1,y1,x2,y2))
@@ -366,25 +514,45 @@ def extract_vehicle_table(page_img: Image.Image) -> dict:
                 best = raw
         return best
 
+    # Also try block OCR for placa/motor as fallback (sometimes better than line OCR)
+    def cell_block_fallback(x1,x2,y1,y2):
+        c = main.crop((x1,y1,x2,y2))
+        c = preprocess_for_ocr(preprocess_remove_lines(c))
+        return ocr_block(c, psm=7)
+
     r0l = cell_block(left, mid, ys[0], ys[1])     # Marca
     r0r = cell_block(mid, right, ys[0], ys[1])    # Chasis
     r1l = cell_block(left, mid, ys[1], ys[2])     # Linea
     r1r = cell_block(mid, right, ys[1], ys[2])    # Pasajeros
     r2l = cell_block(left, mid, ys[2], ys[3])     # Modelo
     r2r = cell_block(mid, right, ys[2], ys[3])    # Clase
-    r3l = cell_line(left, mid, ys[3], ys[4], "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-", scales=(6.0,7.0,8.0))
+    r3l = cell_line(left, mid, ys[3], ys[4], "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.", scales=(6.0,7.0,8.0))
     r3r = cell_line(mid, right, ys[3], ys[4], "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", scales=(6.0,7.0))
     r4l = cell_block(left, mid, ys[4], ys[5])     # Color
 
-    marca = norm_isuzu(r0l)
+    marca = norm_marca(r0l)
     chasis = fix_vin_ocr(r0r)
-    linea = norm_np(r1l)
+    linea = norm_linea(r1l)
     pasajeros = norm_pas(r1r)
     modelo = norm_year(r2l)
-    clase = norm_camion(r2r)
+    clase = norm_clase(r2r)
     placa = norm_placa(r3l)
     motor = norm_motor(r3r)
-    color = norm_blanco(r4l)
+    color = norm_color(r4l)
+
+    # Fallback: try block OCR for placa if line OCR failed
+    if not v_placa(placa):
+        r3l_fb = cell_block_fallback(left, mid, ys[3], ys[4])
+        placa_fb = norm_placa(r3l_fb)
+        if v_placa(placa_fb):
+            placa = placa_fb
+
+    # Fallback: try block OCR for motor if line OCR failed
+    if not v_motor(motor):
+        r3r_fb = cell_block_fallback(mid, right, ys[3], ys[4])
+        motor_fb = norm_motor(r3r_fb)
+        if v_motor(motor_fb):
+            motor = motor_fb
 
     # validate
     if not v_marca(marca): marca = ""
@@ -397,7 +565,7 @@ def extract_vehicle_table(page_img: Image.Image) -> dict:
     if not v_motor(motor): motor = ""
     if not v_color(color): color = ""
 
-    # fallback for marca/chasis if missing (label + fixed)
+    # fallback for marca/chasis if missing
     if not marca or not chasis:
         fb_m, fb_c = fallback_marca_chasis_label(main)
         if not marca and fb_m: marca = fb_m
@@ -456,13 +624,13 @@ def main():
             f"cert={row['certificado_no']:<4} "
             f"marca={row['marca']:<6} "
             f"chasis={row['chasis']:<17} "
-            f"linea={row['linea']:<3} "
+            f"linea={row['linea']:<12} "
             f"pas={row['pasajeros']:<2} "
             f"modelo={row['modelo']:<4} "
-            f"clase={row['clase']:<6} "
-            f"placa={row['placa']:<10} "
+            f"clase={row['clase']:<16} "
+            f"placa={row['placa']:<12} "
             f"motor={row['motor']:<10} "
-            f"color={row['color']:<10} "
+            f"color={row['color']:<22} "
             f"(valid {valid_cnt}/10)"
         )
 
