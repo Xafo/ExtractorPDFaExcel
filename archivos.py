@@ -47,8 +47,9 @@ LABEL_NOISE = {
 }
 
 KNOWN_MARCAS = {
-    "ISUZU", "INTERNATIONAL", "SUZUKI", "HINO", "GREAT", "WALL", "TOYOTA", "NISSAN", "HONDA",
+    "ISUZU", "INTERNATIONAL", "SUZUKI", "HINO", "GREAT", "GREATDANE", "WALL", "TOYOTA", "NISSAN", "HONDA",
     "MITSUBISHI", "MAZDA", "HYUNDAI", "KIA", "CHEVROLET", "FORD", "VOLKSWAGEN", "MERCEDESBENZ",
+    "UTILITY",
 }
 
 KNOWN_CLASES = {
@@ -59,6 +60,16 @@ KNOWN_CLASES = {
 KNOWN_COLORS = {
     "BLANCO", "NEGRO", "ROJO", "GRIS", "AZUL", "S/C", "PLATEADO", "PLATEADO METALICO",
     "BLANCO PERLA DOLOMITE", "BLANCO Y CALCOMANIA MULTICOLOR",
+}
+
+MARCA_ALIAS = {
+    "TSUZU": "ISUZU",
+    "IISUZU": "ISUZU",
+    "1SUZU": "ISUZU",
+    "SUZU": "ISUZU",
+    "ISUZLI": "ISUZU",
+    "LSUZU": "ISUZU",
+    "GREATDANE": "GREATDANE",
 }
 
 FIELD_WEIGHTS = {
@@ -216,13 +227,27 @@ def find_vehicle_rows(main_pil: Image.Image, v_lines, h_lines):
 # Normalizers (GENERALIZED)
 # -------------------------
 def norm_marca(txt: str) -> str:
-    """Normaliza marca - acepta ISUZU y variantes OCR."""
-    t = re.sub(r"[^A-Z]", "", (txt or "").upper())
-    if "ISUZU" in t or t in ("TSUZU","RSUZU","IISUZU","SUZU","TSU","ISUZLI","1SUZU"):
-        return "ISUZU"
-    # Devolver el texto limpio si no es ISUZU
-    if len(t) >= 3:
-        return t
+    """Normaliza marca con reglas estrictas para evitar ruido OCR."""
+    raw = (txt or "").upper()
+    raw = re.sub(r"\s+", " ", raw).strip()
+    for stopper in ("CHASIS", "LINEA", "PASAJEROS", "MODELO", "CLASE", "PLACA", "MOTOR", "COLOR"):
+        idx = raw.find(stopper)
+        if idx > 0:
+            raw = raw[:idx]
+            break
+
+    t = re.sub(r"[^A-Z]", "", raw)
+    if not t:
+        return ""
+
+    for bad, good in MARCA_ALIAS.items():
+        t = t.replace(bad, good)
+
+    candidates = sorted(KNOWN_MARCAS, key=len, reverse=True)
+    for brand in candidates:
+        if brand in t:
+            return brand
+
     return ""
 
 def fix_vin_ocr(txt: str) -> str:
@@ -297,10 +322,12 @@ def norm_linea(txt: str) -> str:
     if "NQR" in t_clean:
         return "NQR"
 
-    # Devolver el texto limpio si tiene al menos 1 carácter
-    cleaned = re.sub(r"[^A-Z0-9\s\-/]", "", t).strip()
-    if cleaned:
-        return cleaned
+    cleaned = re.sub(r"[^A-Z0-9\-/]", "", t)
+    cleaned = cleaned.replace("LINEA", "")
+    cleaned = cleaned.strip("-/ ")
+    if 1 <= len(cleaned) <= 12:
+        if cleaned not in LABEL_NOISE:
+            return cleaned
     return ""
 
 def norm_pas(txt: str) -> str:
@@ -325,9 +352,8 @@ def norm_clase(txt: str) -> str:
         return "SUV"
     if "PICKUP" in t:
         return "PICKUP"
-    # Return cleaned text if something is there
     cleaned = re.sub(r"[^A-Z0-9\s/]", "", t).strip()
-    if cleaned:
+    if cleaned in KNOWN_CLASES:
         return cleaned
     return ""
 
@@ -350,9 +376,12 @@ def norm_color(txt: str) -> str:
     if "AZUL" in t:
         return "AZUL"
 
-    # Return cleaned text
+    for c in ["PLATEADO METALICO", "PLATEADO", "BLANCO", "NEGRO", "ROJO", "GRIS", "AZUL"]:
+        if c in t:
+            return c
+
     cleaned = re.sub(r"[^A-Z0-9\s/]", "", t).strip()
-    if cleaned:
+    if cleaned in KNOWN_COLORS:
         return cleaned
     return ""
 
@@ -444,6 +473,16 @@ def has_label_noise(txt: str) -> bool:
     return any(t in LABEL_NOISE for t in tokens)
 
 
+def has_label_noise_substring(txt: str) -> bool:
+    t = re.sub(r"[^A-Z]", "", (txt or "").upper())
+    if not t:
+        return False
+    for bad in LABEL_NOISE:
+        if bad in t:
+            return True
+    return False
+
+
 def v_cert(x):
     return bool(re.fullmatch(r"\d{1,4}", x or ""))
 
@@ -452,7 +491,7 @@ def v_marca(x):
     t = re.sub(r"[^A-Z]", "", (x or "").upper())
     if not t or t in LABEL_NOISE or t.startswith("PLAC"):
         return False
-    return t in KNOWN_MARCAS or len(t) >= 4
+    return t in KNOWN_MARCAS
 
 
 def v_chasis(x):
@@ -461,7 +500,7 @@ def v_chasis(x):
 
 def v_linea(x):
     t = norm_spaces((x or "").upper())
-    if not t or has_label_noise(t):
+    if not t or has_label_noise(t) or has_label_noise_substring(t):
         return False
     if len(t) > 20:
         return False
@@ -485,14 +524,14 @@ def v_clase(x):
     t = norm_spaces((x or "").upper())
     if not t or has_label_noise(t):
         return False
-    return t in KNOWN_CLASES or (3 <= len(t) <= 20)
+    return t in KNOWN_CLASES
 
 
 def v_color(x):
     t = norm_spaces((x or "").upper())
     if not t or has_label_noise(t):
         return False
-    return t in KNOWN_COLORS or (3 <= len(t) <= 40)
+    return t in KNOWN_COLORS
 
 
 def v_placa(x):
@@ -904,19 +943,25 @@ def compute_metrics(df: pd.DataFrame):
     return completeness, by_field
 
 
-def _mode_non_empty(series: pd.Series) -> str:
+def _mode_non_empty(series) -> str:
+    if series is None:
+        return ""
     vals = [str(v).strip() for v in series.tolist() if str(v).strip()]
     if not vals:
         return ""
-    return pd.Series(vals).value_counts().idxmax()
+    return str(pd.Series(vals).value_counts().idxmax())
 
 
 def aggressive_post_fill(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    mode_pas = _mode_non_empty(df.get("pasajeros", pd.Series(dtype=str))) or "3"
-    mode_modelo = _mode_non_empty(df.get("modelo", pd.Series(dtype=str)))
-    mode_linea = _mode_non_empty(df.get("linea", pd.Series(dtype=str)))
+    pas_series = df["pasajeros"] if "pasajeros" in df.columns else pd.Series(dtype=str)
+    mod_series = df["modelo"] if "modelo" in df.columns else pd.Series(dtype=str)
+    lin_series = df["linea"] if "linea" in df.columns else pd.Series(dtype=str)
+
+    mode_pas = _mode_non_empty(pas_series) or "3"
+    mode_modelo = _mode_non_empty(mod_series)
+    mode_linea = _mode_non_empty(lin_series)
 
     for i in df.index:
         marca = str(df.at[i, "marca"]).strip().upper()
