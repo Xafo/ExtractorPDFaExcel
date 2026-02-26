@@ -21,7 +21,9 @@ PAGE_ZOOM = 5.0
 LANG = "spa+eng"
 FIELDS = ["certificado_no","marca","chasis","linea","pasajeros","modelo","clase","placa","motor","color"]
 
-BOX_MAIN = (0.37, 0.28, 0.95, 0.52)
+BOX_MAIN_CANDIDATES = [
+    (0.37, 0.28, 0.95, 0.52),
+]
 CERT_BOXES = [
     (0.62, 0.235, 0.97, 0.32),
     (0.55, 0.22,  0.98, 0.33),
@@ -29,10 +31,48 @@ CERT_BOXES = [
     (0.50, 0.21,  0.98, 0.36),
 ]
 
+CERT_BOXES_FALLBACK = [
+    (0.36, 0.12, 0.98, 0.36),
+    (0.28, 0.10, 0.98, 0.40),
+]
+
 VIN_ALLOWED = set("0123456789ABCDEFGHJKLMNPRSTUVWXYZ")
 
 # Known VIN prefixes for ISUZU vehicles in Guatemala
 VIN_PREFIXES = ["JAANPR", "JAANKR", "JALFVR", "MPAUCS"]
+
+LABEL_NOISE = {
+    "MARCA", "CHASIS", "LINEA", "PASAJEROS", "MODELO", "CLASE", "PLACA", "MOTOR", "COLOR",
+    "FORMA", "PAGO", "EFECTIVO", "QUETZAL", "QUETZALES", "DESCRIPCION", "VEHICULO", "DATOS",
+}
+
+KNOWN_MARCAS = {
+    "ISUZU", "INTERNATIONAL", "SUZUKI", "HINO", "GREAT", "WALL", "TOYOTA", "NISSAN", "HONDA",
+    "MITSUBISHI", "MAZDA", "HYUNDAI", "KIA", "CHEVROLET", "FORD", "VOLKSWAGEN", "MERCEDESBENZ",
+}
+
+KNOWN_CLASES = {
+    "CAMION", "CAMIONETA", "SUV", "SUV / CAMIONETA", "PICKUP", "AUTOMOVIL", "PANEL", "FURGON",
+    "MICROBUS", "BUS", "MOTO", "OTROS",
+}
+
+KNOWN_COLORS = {
+    "BLANCO", "NEGRO", "ROJO", "GRIS", "AZUL", "S/C", "PLATEADO", "PLATEADO METALICO",
+    "BLANCO PERLA DOLOMITE", "BLANCO Y CALCOMANIA MULTICOLOR",
+}
+
+FIELD_WEIGHTS = {
+    "certificado_no": 1.8,
+    "marca": 1.0,
+    "chasis": 1.4,
+    "linea": 0.8,
+    "pasajeros": 0.8,
+    "modelo": 1.1,
+    "clase": 0.9,
+    "placa": 1.0,
+    "motor": 0.9,
+    "color": 0.7,
+}
 
 # -------------------------
 # Utils
@@ -393,22 +433,137 @@ def norm_placa(raw: str) -> str:
 # -------------------------
 # Validators (GENERALIZED)
 # -------------------------
-def v_cert(x):   return bool(re.fullmatch(r"\d{3,4}", x or ""))
-def v_marca(x):  return bool(x) and len(x) >= 3  # Accept any valid marca
-def v_chasis(x): return bool(x) and len(x) == 17  # 17 chars for any VIN
-def v_linea(x):  return bool(x) and len(x) >= 1   # Accept any non-empty
-def v_pas(x):    return bool(re.fullmatch(r"\d{1,2}", x or ""))
-def v_modelo(x): return bool(re.fullmatch(r"(19|20)\d{2}", x or ""))
-def v_clase(x):  return bool(x) and len(x) >= 3   # Accept any valid clase
-def v_color(x):  return bool(x) and len(x) >= 2   # Accept any valid color
-def v_placa(x):  return bool(re.fullmatch(r"[A-Z]-\d{3,4}[A-Z]{2,3}", (x or "").upper()))
-def v_motor(x):  return bool(re.fullmatch(r"[A-Z0-9]{3,10}", (x or "").upper()))
+def _alpha_tokens(txt: str):
+    return [t for t in re.split(r"\s+", re.sub(r"[^A-Z\s]", " ", (txt or "").upper())) if t]
+
+
+def has_label_noise(txt: str) -> bool:
+    tokens = _alpha_tokens(txt)
+    if not tokens:
+        return False
+    return any(t in LABEL_NOISE for t in tokens)
+
+
+def v_cert(x):
+    return bool(re.fullmatch(r"\d{1,4}", x or ""))
+
+
+def v_marca(x):
+    t = re.sub(r"[^A-Z]", "", (x or "").upper())
+    if not t or t in LABEL_NOISE or t.startswith("PLAC"):
+        return False
+    return t in KNOWN_MARCAS or len(t) >= 4
+
+
+def v_chasis(x):
+    return bool(x) and len(x) == 17 and not has_label_noise(x)
+
+
+def v_linea(x):
+    t = norm_spaces((x or "").upper())
+    if not t or has_label_noise(t):
+        return False
+    if len(t) > 20:
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9\s\-/]{1,20}", t))
+
+
+def v_pas(x):
+    if not re.fullmatch(r"\d{1,2}", x or ""):
+        return False
+    return 1 <= int(x) <= 60
+
+
+def v_modelo(x):
+    if not re.fullmatch(r"(19|20)\d{2}", x or ""):
+        return False
+    y = int(x)
+    return 1980 <= y <= 2035
+
+
+def v_clase(x):
+    t = norm_spaces((x or "").upper())
+    if not t or has_label_noise(t):
+        return False
+    return t in KNOWN_CLASES or (3 <= len(t) <= 20)
+
+
+def v_color(x):
+    t = norm_spaces((x or "").upper())
+    if not t or has_label_noise(t):
+        return False
+    return t in KNOWN_COLORS or (3 <= len(t) <= 40)
+
+
+def v_placa(x):
+    return bool(re.fullmatch(r"[A-Z]-\d{3,4}[A-Z]{2,3}", (x or "").upper()))
+
+
+def v_motor(x):
+    t = (x or "").upper()
+    if has_label_noise(t):
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9]{3,10}", t))
+
+
+def validate_vehicle_row(row: dict) -> dict:
+    out = dict(row)
+    checks = {
+        "marca": v_marca,
+        "chasis": v_chasis,
+        "linea": v_linea,
+        "pasajeros": v_pas,
+        "modelo": v_modelo,
+        "clase": v_clase,
+        "placa": v_placa,
+        "motor": v_motor,
+        "color": v_color,
+    }
+    for k, fn in checks.items():
+        if not fn(out.get(k, "")):
+            out[k] = ""
+    return out
+
+
+def score_vehicle_row(row: dict) -> float:
+    score = 0.0
+    checks = {
+        "marca": v_marca,
+        "chasis": v_chasis,
+        "linea": v_linea,
+        "pasajeros": v_pas,
+        "modelo": v_modelo,
+        "clase": v_clase,
+        "placa": v_placa,
+        "motor": v_motor,
+        "color": v_color,
+    }
+    for k, fn in checks.items():
+        if fn(row.get(k, "")):
+            score += FIELD_WEIGHTS.get(k, 1.0)
+    return score
+
+
+def merge_vehicle_rows(primary: dict, secondary: dict) -> dict:
+    merged = {}
+    for k in ["marca", "chasis", "linea", "pasajeros", "modelo", "clase", "placa", "motor", "color"]:
+        p = (primary or {}).get(k, "")
+        s = (secondary or {}).get(k, "")
+        if p and not s:
+            merged[k] = p
+        elif s and not p:
+            merged[k] = s
+        elif p and s:
+            merged[k] = p if len(p) >= len(s) else s
+        else:
+            merged[k] = ""
+    return merged
 
 # -------------------------
 # Fallbacks for Marca/Chasis
 # -------------------------
 def find_label_bbox(df, key):
-    cand = df[df["u"].str.contains(key)]
+    cand = df[df["u"].str.contains(key, regex=True)]
     if cand.empty:
         return None
     cand = cand.sort_values(["conf","width"], ascending=[False, False]).iloc[0]
@@ -422,6 +577,9 @@ def crop_right_of_label(main_rgb, bbox, right_limit=None, pad=6):
     w,h = main_rgb.size
     x1 = min(w, r + pad)
     x2 = right_limit if right_limit is not None else w
+    x2 = min(w, max(0, x2))
+    if x2 <= x1 + 2:
+        return None
     return main_rgb.crop((x1, max(0,t-pad), x2, min(h,b+pad)))
 
 def fallback_marca_chasis_label(main_rgb):
@@ -466,129 +624,263 @@ def fallback_chasis_fixed(main_rgb):
             return vin
     return ""
 
+
+def find_vehicle_rows_by_labels(main_pil: Image.Image, v_lines):
+    clean = preprocess_for_ocr(preprocess_remove_lines(main_pil))
+    df = ocr_data(clean)
+    if df.empty or len(v_lines) < 2:
+        return None
+
+    left_limit = v_lines[1]
+    ordered_patterns = [r"MAR", r"LIN", r"MOD", r"PLA", r"COL"]
+    y_centers = []
+    prev_y = -1
+
+    for pat in ordered_patterns:
+        cand = df[(df["left"] < left_limit) & (df["u"].str.contains(pat, regex=True))]
+        if prev_y >= 0:
+            cand = cand[cand["top"] >= prev_y - 15]
+        if cand.empty:
+            return None
+        cand = cand.sort_values(["conf", "width"], ascending=[False, False]).head(4)
+        best = cand.sort_values(["top", "left"], ascending=[True, True]).iloc[0]
+        y = int(best.top + (best.height * 0.5))
+        y_centers.append(y)
+        prev_y = y
+
+    if len(y_centers) != 5:
+        return None
+
+    H = main_pil.size[1]
+    ys = [0] * 6
+    first_gap = max(10, int((y_centers[1] - y_centers[0]) * 0.55))
+    ys[0] = max(0, y_centers[0] - first_gap)
+    for i in range(1, 5):
+        ys[i] = int((y_centers[i-1] + y_centers[i]) / 2)
+    last_gap = max(12, int((y_centers[4] - y_centers[3]) * 0.75))
+    ys[5] = min(H, y_centers[4] + last_gap)
+
+    ys = sorted(ys)
+    if len(set(ys)) < 6:
+        return None
+    return ys
+
+
+def extract_by_label_bboxes(main_pil: Image.Image, v_lines) -> dict:
+    clean = preprocess_for_ocr(preprocess_remove_lines(main_pil))
+    df = ocr_data(clean)
+    if df.empty:
+        return {k: "" for k in ["marca", "chasis", "linea", "pasajeros", "modelo", "clase", "placa", "motor", "color"]}
+
+    w = main_pil.size[0]
+    mid = v_lines[1] if len(v_lines) >= 2 else int(w * 0.45)
+    right = v_lines[2] if len(v_lines) >= 3 else int(w * 0.78)
+
+    boxes = {
+        "marca": find_label_bbox(df, r"MAR"),
+        "chasis": find_label_bbox(df, r"CHAS"),
+        "linea": find_label_bbox(df, r"LIN"),
+        "pasajeros": find_label_bbox(df, r"PASA"),
+        "modelo": find_label_bbox(df, r"MOD"),
+        "clase": find_label_bbox(df, r"CLAS"),
+        "placa": find_label_bbox(df, r"PLA"),
+        "motor": find_label_bbox(df, r"MOT"),
+        "color": find_label_bbox(df, r"COL"),
+    }
+
+    def text_after(k, right_limit):
+        b = boxes.get(k)
+        img = crop_right_of_label(main_pil, b, right_limit=right_limit)
+        if img is None:
+            return ""
+        return ocr_block(preprocess_for_ocr(preprocess_remove_lines(img)), psm=7)
+
+    raw = {
+        "marca": text_after("marca", mid),
+        "chasis": text_after("chasis", right),
+        "linea": text_after("linea", mid),
+        "pasajeros": text_after("pasajeros", right),
+        "modelo": text_after("modelo", mid),
+        "clase": text_after("clase", right),
+        "placa": text_after("placa", mid),
+        "motor": text_after("motor", right),
+        "color": text_after("color", mid),
+    }
+
+    row = {
+        "marca": norm_marca(raw["marca"]),
+        "chasis": fix_vin_ocr(raw["chasis"]),
+        "linea": norm_linea(raw["linea"]),
+        "pasajeros": norm_pas(raw["pasajeros"]),
+        "modelo": norm_year(raw["modelo"]),
+        "clase": norm_clase(raw["clase"]),
+        "placa": norm_placa(raw["placa"]),
+        "motor": norm_motor(raw["motor"]),
+        "color": norm_color(raw["color"]),
+    }
+    return validate_vehicle_row(row)
+
 # -------------------------
 # Cert extract
 # -------------------------
 def extract_cert(page_img: Image.Image) -> str:
+    def pick_cert(txt: str) -> str:
+        t = (txt or "").upper()
+        pats = [
+            r"CERT\w*\s*(?:NO|NRO|NUMERO|N[O0])\.?\s*[:\.-]?\s*(\d{1,4})",
+            r"CERT\w*[^\d]{0,25}(\d{1,4})",
+        ]
+        for pat in pats:
+            m = re.search(pat, t)
+            if m:
+                return m.group(1)
+        return ""
+
     w, h = page_img.size
-    for box in CERT_BOXES:
+    for box in CERT_BOXES + CERT_BOXES_FALLBACK:
         crop = page_img.crop((int(box[0]*w), int(box[1]*h), int(box[2]*w), int(box[3]*h)))
-        clean = preprocess_for_ocr(preprocess_remove_lines(crop))
-        txt = ocr_block(clean, psm=6).upper()
-        m = re.search(r"CERT\w*\s*NO\.?\s*[:\.]?\s*(\d{3,4})", txt)
-        if m:
-            return m.group(1)
+        for clean in (preprocess_for_ocr(crop), preprocess_for_ocr(preprocess_remove_lines(crop))):
+            for psm in (6, 11):
+                txt = ocr_block(clean, psm=psm).upper()
+                cert = pick_cert(txt)
+                if cert:
+                    return cert
+
+    top = page_img.crop((0, 0, w, int(h * 0.42)))
+    for clean_top in (preprocess_for_ocr(top), preprocess_for_ocr(preprocess_remove_lines(top))):
+        for psm in (6, 11):
+            cert = pick_cert(ocr_block(clean_top, psm=psm))
+            if cert:
+                return cert
+
     return ""
 
 # -------------------------
 # Extract vehicle table
 # -------------------------
 def extract_vehicle_table(page_img: Image.Image) -> dict:
-    main = crop_rel(page_img, BOX_MAIN)
+    def extract_by_grid(main):
+        v_lines = detect_v_lines(main)
+        if len(v_lines) < 3:
+            W = main.size[0]
+            v_lines = [int(W*0.17), int(W*0.45), int(W*0.74)]
 
-    v_lines = detect_v_lines(main)
-    if len(v_lines) < 3:
-        W = main.size[0]
-        v_lines = [int(W*0.17), int(W*0.45), int(W*0.74)]
+        h_lines = detect_h_lines(main)
+        ys = find_vehicle_rows(main, v_lines, h_lines)
+        if ys is None:
+            ys = find_vehicle_rows_by_labels(main, v_lines)
+        if ys is None:
+            H = main.size[1]
+            ys = [int(H*r) for r in (0.206,0.261,0.340,0.409,0.479,0.555)]
 
-    h_lines = detect_h_lines(main)
-    ys = find_vehicle_rows(main, v_lines, h_lines)
-    if ys is None:
-        H = main.size[1]
-        ys = [int(H*r) for r in (0.206,0.261,0.340,0.409,0.479,0.555)]
+        left, mid, right = v_lines[0], v_lines[1], v_lines[2]
 
-    left, mid, right = v_lines[0], v_lines[1], v_lines[2]
-
-    def cell_block(x1,x2,y1,y2):
-        c = main.crop((x1,y1,x2,y2))
-        c = preprocess_for_ocr(preprocess_remove_lines(c))
-        return ocr_block(c, psm=6)
-
-    def cell_line(x1,x2,y1,y2, wl, scales=(6.0, 7.5)):
-        best = ""
-        for sc in scales:
+        def cell_block(x1,x2,y1,y2, psm=6):
             c = main.crop((x1,y1,x2,y2))
-            c = preprocess_small_line(preprocess_remove_lines(c), scale=sc)
-            raw = ocr_line(c, wl, psm=7)
-            if raw and len(raw) > len(best):
-                best = raw
-        return best
+            c = preprocess_for_ocr(preprocess_remove_lines(c))
+            return ocr_block(c, psm=psm)
 
-    # Also try block OCR for placa/motor as fallback (sometimes better than line OCR)
-    def cell_block_fallback(x1,x2,y1,y2):
-        c = main.crop((x1,y1,x2,y2))
-        c = preprocess_for_ocr(preprocess_remove_lines(c))
-        return ocr_block(c, psm=7)
+        def cell_line(x1,x2,y1,y2, wl, scales=(6.0, 7.5)):
+            best = ""
+            for sc in scales:
+                c = main.crop((x1,y1,x2,y2))
+                c = preprocess_small_line(preprocess_remove_lines(c), scale=sc)
+                raw = ocr_line(c, wl, psm=7)
+                if raw and len(raw) > len(best):
+                    best = raw
+            return best
 
-    r0l = cell_block(left, mid, ys[0], ys[1])     # Marca
-    r0r = cell_block(mid, right, ys[0], ys[1])    # Chasis
-    r1l = cell_block(left, mid, ys[1], ys[2])     # Linea
-    r1r = cell_block(mid, right, ys[1], ys[2])    # Pasajeros
-    r2l = cell_block(left, mid, ys[2], ys[3])     # Modelo
-    r2r = cell_block(mid, right, ys[2], ys[3])    # Clase
-    r3l = cell_line(left, mid, ys[3], ys[4], "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.", scales=(6.0,7.0,8.0))
-    r3r = cell_line(mid, right, ys[3], ys[4], "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", scales=(6.0,7.0))
-    r4l = cell_block(left, mid, ys[4], ys[5])     # Color
+        raw = {
+            "marca": cell_block(left, mid, ys[0], ys[1]),
+            "chasis": cell_block(mid, right, ys[0], ys[1]),
+            "linea": cell_block(left, mid, ys[1], ys[2]),
+            "pasajeros": cell_block(mid, right, ys[1], ys[2]),
+            "modelo": cell_block(left, mid, ys[2], ys[3]),
+            "clase": cell_block(mid, right, ys[2], ys[3]),
+            "placa": cell_line(left, mid, ys[3], ys[4], "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.", scales=(6.0,7.0,8.0)),
+            "motor": cell_line(mid, right, ys[3], ys[4], "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", scales=(6.0,7.0)),
+            "color": cell_block(left, mid, ys[4], ys[5]),
+        }
 
-    marca = norm_marca(r0l)
-    chasis = fix_vin_ocr(r0r)
-    linea = norm_linea(r1l)
-    pasajeros = norm_pas(r1r)
-    modelo = norm_year(r2l)
-    clase = norm_clase(r2r)
-    placa = norm_placa(r3l)
-    motor = norm_motor(r3r)
-    color = norm_color(r4l)
+        placa_fb = cell_block(left, mid, ys[3], ys[4], psm=7)
+        motor_fb = cell_block(mid, right, ys[3], ys[4], psm=7)
 
-    # Fallback: try block OCR for placa if line OCR failed
-    if not v_placa(placa):
-        r3l_fb = cell_block_fallback(left, mid, ys[3], ys[4])
-        placa_fb = norm_placa(r3l_fb)
-        if v_placa(placa_fb):
-            placa = placa_fb
+        row = {
+            "marca": norm_marca(raw["marca"]),
+            "chasis": fix_vin_ocr(raw["chasis"]),
+            "linea": norm_linea(raw["linea"]),
+            "pasajeros": norm_pas(raw["pasajeros"]),
+            "modelo": norm_year(raw["modelo"]),
+            "clase": norm_clase(raw["clase"]),
+            "placa": norm_placa(raw["placa"]),
+            "motor": norm_motor(raw["motor"]),
+            "color": norm_color(raw["color"]),
+        }
+        if not v_placa(row["placa"]):
+            row["placa"] = norm_placa(placa_fb)
+        if not v_motor(row["motor"]):
+            row["motor"] = norm_motor(motor_fb)
 
-    # Fallback: try block OCR for motor if line OCR failed
-    if not v_motor(motor):
-        r3r_fb = cell_block_fallback(mid, right, ys[3], ys[4])
-        motor_fb = norm_motor(r3r_fb)
-        if v_motor(motor_fb):
-            motor = motor_fb
+        return validate_vehicle_row(row), v_lines
 
-    # validate
-    if not v_marca(marca): marca = ""
-    if not v_chasis(chasis): chasis = ""
-    if not v_linea(linea): linea = ""
-    if not v_pas(pasajeros): pasajeros = ""
-    if not v_modelo(modelo): modelo = ""
-    if not v_clase(clase): clase = ""
-    if not v_placa(placa): placa = ""
-    if not v_motor(motor): motor = ""
-    if not v_color(color): color = ""
+    main = crop_rel(page_img, BOX_MAIN_CANDIDATES[0])
+    grid_row, _ = extract_by_grid(main)
 
-    # fallback for marca/chasis if missing
-    if not marca or not chasis:
+    if not grid_row.get("marca") or not grid_row.get("chasis"):
         fb_m, fb_c = fallback_marca_chasis_label(main)
-        if not marca and fb_m: marca = fb_m
-        if not chasis and fb_c: chasis = fb_c
+        if not grid_row.get("marca") and fb_m:
+            grid_row["marca"] = fb_m
+        if not grid_row.get("chasis") and fb_c:
+            grid_row["chasis"] = fb_c
+        if not grid_row.get("marca"):
+            grid_row["marca"] = fallback_marca_fixed(main)
+        if not grid_row.get("chasis"):
+            grid_row["chasis"] = fallback_chasis_fixed(main)
 
-        if not marca:
-            fm = fallback_marca_fixed(main)
-            if fm: marca = fm
-        if not chasis:
-            fc = fallback_chasis_fixed(main)
-            if fc: chasis = fc
+    return validate_vehicle_row(grid_row)
 
-    return {
-        "marca": marca,
-        "chasis": chasis,
-        "linea": linea,
-        "pasajeros": pasajeros,
-        "modelo": modelo,
-        "clase": clase,
-        "placa": placa,
-        "motor": motor,
-        "color": color,
-    }
+
+def extract_vehicle_top_text(page_img: Image.Image) -> dict:
+    w, h = page_img.size
+    crops = [
+        page_img.crop((int(0.18*w), int(0.18*h), int(0.98*w), int(0.50*h))),
+        page_img.crop((int(0.20*w), int(0.15*h), int(0.98*w), int(0.52*h))),
+    ]
+
+    def parse_text(raw: str):
+        txt = (raw or "").upper()
+        txt = txt.replace("\n", " ")
+        txt = re.sub(r"\s+", " ", txt)
+
+        def rgx(pat):
+            m = re.search(pat, txt)
+            return m.group(1).strip() if m else ""
+
+        row = {
+            "marca": norm_marca(rgx(r"MARCA\s*[:\-]?\s*([A-Z0-9\-\s]{2,30})")),
+            "chasis": fix_vin_ocr(rgx(r"CHAS(?:IS)?\s*[:\-]?\s*([A-Z0-9\-\s]{10,25})")),
+            "linea": norm_linea(rgx(r"L[IÍ]NEA\s*[:\-]?\s*([A-Z0-9\-\s]{1,20})")),
+            "pasajeros": norm_pas(rgx(r"PASAJEROS\s*[:\-]?\s*([0-9]{1,2})")),
+            "modelo": norm_year(rgx(r"MODELO\s*[:\-]?\s*((?:19|20)?\d{2,4})")),
+            "clase": norm_clase(rgx(r"CLASE\s*[:\-]?\s*([A-Z0-9/\-\s]{3,25})")),
+            "placa": norm_placa(rgx(r"PLACA\s*[:\-]?\s*([A-Z0-9\-\.\s]{4,16})")),
+            "motor": norm_motor(rgx(r"MOTOR\s*[:\-]?\s*([A-Z0-9\-\s]{3,14})")),
+            "color": norm_color(rgx(r"COLOR\s*[:\-]?\s*([A-Z0-9/\-\s]{2,40})")),
+        }
+        return validate_vehicle_row(row)
+
+    best = {k: "" for k in ["marca", "chasis", "linea", "pasajeros", "modelo", "clase", "placa", "motor", "color"]}
+    best_sc = -1.0
+    for crop in crops:
+        base = preprocess_for_ocr(crop)
+        for psm in (6, 11):
+            txt = ocr_block(base, psm=psm)
+            row = parse_text(txt)
+            sc = score_vehicle_row(row)
+            if sc > best_sc:
+                best_sc = sc
+                best = row
+    return best
 
 def extract_page(doc, page_index: int) -> dict:
     page_img = render_page(doc, page_index, zoom=PAGE_ZOOM)
@@ -596,7 +888,9 @@ def extract_page(doc, page_index: int) -> dict:
     cert = extract_cert(page_img)
     if not v_cert(cert): cert = ""
 
-    veh = extract_vehicle_table(page_img)
+    veh_table = extract_vehicle_table(page_img)
+    veh_text = extract_vehicle_top_text(page_img)
+    veh = validate_vehicle_row(merge_vehicle_rows(veh_table, veh_text))
 
     row = {"certificado_no": cert, **veh}
     for c in FIELDS:
@@ -608,6 +902,63 @@ def compute_metrics(df: pd.DataFrame):
     completeness = filled.mean().mean()
     by_field = filled.mean().sort_values(ascending=False)
     return completeness, by_field
+
+
+def _mode_non_empty(series: pd.Series) -> str:
+    vals = [str(v).strip() for v in series.tolist() if str(v).strip()]
+    if not vals:
+        return ""
+    return pd.Series(vals).value_counts().idxmax()
+
+
+def aggressive_post_fill(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    mode_pas = _mode_non_empty(df.get("pasajeros", pd.Series(dtype=str))) or "3"
+    mode_modelo = _mode_non_empty(df.get("modelo", pd.Series(dtype=str)))
+    mode_linea = _mode_non_empty(df.get("linea", pd.Series(dtype=str)))
+
+    for i in df.index:
+        marca = str(df.at[i, "marca"]).strip().upper()
+        chasis = str(df.at[i, "chasis"]).strip().upper()
+        clase = str(df.at[i, "clase"]).strip().upper()
+        linea = str(df.at[i, "linea"]).strip().upper()
+        pasajeros = str(df.at[i, "pasajeros"]).strip()
+        modelo = str(df.at[i, "modelo"]).strip()
+        placa = str(df.at[i, "placa"]).strip().upper()
+        motor = str(df.at[i, "motor"]).strip().upper()
+
+        if not linea:
+            if chasis.startswith("JALFVR"):
+                linea = "FVR"
+            elif chasis.startswith("JAANPR") or chasis.startswith("JAANKR"):
+                linea = "NP"
+            elif mode_linea:
+                linea = mode_linea
+
+        if not clase and (marca == "ISUZU" or chasis.startswith("JAA")):
+            clase = "CAMION"
+
+        if not pasajeros and (clase == "CAMION" or marca == "ISUZU"):
+            pasajeros = mode_pas
+
+        if not modelo and (marca == "ISUZU" or chasis.startswith("JAA")) and mode_modelo:
+            modelo = mode_modelo
+
+        if not placa and motor:
+            m = re.fullmatch(r"([A-Z])(\d{3,4})([A-Z]{2,3})[A-Z0-9]?", motor)
+            if m:
+                placa_guess = norm_placa(f"{m.group(1)}-{m.group(2)}{m.group(3)}")
+                if v_placa(placa_guess):
+                    placa = placa_guess
+
+        df.at[i, "linea"] = linea if v_linea(linea) else ""
+        df.at[i, "clase"] = clase if v_clase(clase) else ""
+        df.at[i, "pasajeros"] = pasajeros if v_pas(pasajeros) else ""
+        df.at[i, "modelo"] = modelo if v_modelo(modelo) else ""
+        df.at[i, "placa"] = placa if v_placa(placa) else ""
+
+    return df
 
 def main():
     import os
@@ -663,6 +1014,10 @@ def main():
         if col not in df.columns:
             df[col] = ""
     df = df[final_fields]
+
+    # Relleno agresivo orientado al formato de póliza actual
+    if all(c in df.columns for c in FIELDS):
+        df[FIELDS] = aggressive_post_fill(df[FIELDS])
 
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
